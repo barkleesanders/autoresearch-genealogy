@@ -2,7 +2,14 @@
 
 An agent skill for AI-assisted genealogy research: family trees, ancestor hunting, DNA-match triangulation, and vital-records work — run with the source rigor of a professional engagement.
 
-It works with any agent that can read a `SKILL.md`-style instruction file (Claude Code and compatible harnesses). The skill is the method; your agent supplies the browsing, searching, and file tools.
+It works with any agent that can read a `SKILL.md`-style instruction file (Claude Code and compatible harnesses). The skill is the method — and this repo ships the tooling the method assumes, including the browser bridge below.
+
+## What's in this repo
+
+- **`SKILL.md`** — the genealogy research skill (the method).
+- **`SETUP-PROMPT.md`** — a copy-paste prompt that makes your agent install and verify the whole stack for you. Start here.
+- **`tools/fcdp/`** — the browser bridge the research runs on: a small Chrome extension + local daemon + CLI that expose most of the Chrome DevTools Protocol on your *real, logged-in* Chrome profile, so your agent can drive record and DNA sites through your own session. Localhost only; it never sees your passwords.
+- **`skills/decompile/`** — a companion reverse-engineering skill: how to take apart binaries, apps, browser extensions — and the private APIs of websites you're logged into (HAR session capture → typed client). This is how the session-replay clients the genealogy method uses get built.
 
 ## Why this exists
 
@@ -39,7 +46,9 @@ This is a method, not a dataset. It contains no one's family data.
 
 ## Install
 
-Copy `SKILL.md` into your agent's skills directory, e.g.:
+**Fastest path:** give your agent the prompt in [`SETUP-PROMPT.md`](SETUP-PROMPT.md) — it installs and verifies everything, including the browser bridge.
+
+By hand: copy `SKILL.md` into your agent's skills directory, e.g.:
 
 ```bash
 mkdir -p ~/.claude/skills/autoresearch-genealogy
@@ -50,7 +59,7 @@ Then invoke it by name (`/autoresearch-genealogy`) or let your agent trigger it 
 
 ## What's not included
 
-- **No tools.** The skill describes the *pattern* for a session-replay API client and a browser bridge; implementations are environment-specific and left to you.
+- **No hosted services, no accounts.** Everything runs locally: the bridge daemon listens on localhost and a Unix socket, the extension talks only to it, and your research data never leaves your machine.
 - **No data.** No trees, no names, no DNA files. Yours stay in your vault.
 - **No guarantees about platform behavior.** Instrument behaviors were measured in real sessions and are dated as such in the skill; platforms change, and the skill's own rule is to re-measure before relying on any of them.
 

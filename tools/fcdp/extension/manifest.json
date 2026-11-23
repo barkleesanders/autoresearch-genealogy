@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "fcdp \u2014 Full CDP Bridge",
+  "version": "0.2.0",
+  "description": "Exposes the full Chrome DevTools Protocol on this profile via chrome.debugger, bridged to a local daemon.",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmUVwUlwzRIH0YjIJXmEDYcUTD1vWmEQIwSdumbd5NMb9CwAyC7ptxIIL+isMuTmnEwIobm8IqcLkAVpbfcE4WTqU0CUT5nDiaI2TmokOJWSRUAUM14hzO3ZIi+mpfLtdxEN9DvuwqJhU4dHa6a4nByMYT4CTXhRVsIEP2lDljwQBSSgP3NXdCjZGyvRBqcNMlj6VDKenE25uJVGPYNaMMPRWvrmI2vD1rhVutZvdv4q39zCZZQfXDuXTNUdDZ+b6rypGiqjuHcaW6TEgsJRTlJ4ta/RdBkRKeEmdAQw1CitFoapTOrl5J2V9O3sFRpVMY10sHef8U+pYdZxEzthSJQIDAQAB"
+}

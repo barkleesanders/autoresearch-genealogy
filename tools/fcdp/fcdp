@@ -1,0 +1,1282 @@
+#!/usr/bin/env python3
+"""fcdp - most of the Chrome DevTools Protocol from the CLI, via our OWN MV3 extension.
+
+ONE tool for everything on your REAL Chrome profiles: everyday driving
+(open/nav/read/find/click/type/fill/key/scroll/shot/wait/js/text) AND the four
+advanced domains curated tools cannot do (pdf/intercept/throttle/trace) — all through
+chrome.debugger.sendCommand, which accepts ANY CDP method.
+
+MULTI-PROFILE: the extension can be loaded in several Chrome profiles. Each
+extension instance carries its profile label (the Chrome directory name,
+e.g. "Profile 1"); the bridge routes by label. `fcdp open` targets the
+default profile unless --profile says otherwise; tabId commands route to
+the owning profile automatically. `fcdp profiles` lists the connected,
+labeled profiles. Load the extension only in profiles you intend to
+automate — profiles without it are never driven.
+
+tabId is OPTIONAL on every command: `fcdp open <url>` caches the new tab in
+~/.cache/fcdp-tab; omit tabId to use it, or pass it explicitly as the first arg.
+
+Wire to the bridge (/tmp/fcdp.sock): 4-byte LE length prefix + JSON.
+  request : {id, tabId, method, params}   or  {op:"subscribe", filter, tabId}
+  reply   : {id, result|error}            events pushed as {event, tabId, params}
+"""
+import socket, struct, json, sys, os, base64, time, select, re, hashlib
+
+SOCK = "/tmp/fcdp.sock"
+# The active-tab cache is a SINGLE shared file by default, which is last-writer-wins.
+# Two concurrent jobs therefore silently drive each other's tab: job A opens (cache=A),
+# job B opens (cache=B), and job A's next tabId-less command targets B. Verified on
+# a live two-job test by watching the file change under two sequential opens.
+# FCDP_TAB_CACHE gives a job its own cache file so tabId-less commands stay scoped to
+# it — this is what `fcdp-job` sets, and what any concurrent cron should set.
+CACHE_OVERRIDE = os.environ.get("FCDP_TAB_CACHE")
+
+# ---- direct-CDP transport (no extension, no bridge) ---------------------------
+# fcdp normally reaches Chrome through our MV3 extension + bridge, because Chrome
+# 136+ REFUSES --remote-debugging-port on the real Default profile. That refusal is
+# the entire reason this tool exists.
+#
+# It does NOT apply to a Chrome launched on its own --user-data-dir, which may expose
+# a debug port freely. (People do run exactly that — a headless Chrome on
+# :9222 with a logged-in profile.) There, the
+# extension route is impossible anyway: verified 2026-07-29 that --load-extension is
+# INERT on Chrome 150 (scratch profile registered 0 extensions, no service-worker
+# target), and a headless Chrome has no UI for the manual "Load unpacked" step.
+#
+# So: set FCDP_CDP_URL to a debug endpoint and the same CLI drives it over raw CDP.
+#   FCDP_CDP_URL=http://127.0.0.1:<port> fcdp tabs  # pin an explicit debug endpoint; no standing :9222 Chrome is assumed
+# Everything except the 5 bridge-only Meta.* calls is passed through untouched.
+CDP_URL = os.environ.get("FCDP_CDP_URL", "").rstrip("/")
+PIPE_SOCKET = os.path.expanduser(os.environ.get("FCDP_PIPE_SOCKET", ""))
+
+
+def _autodetect_cdp():
+    """Only consulted when there is NO bridge socket, so a host with a working bridge
+    (a desktop) can never be silently switched off it. On a headless host — where
+    the extension route is impossible (--load-extension inert on Chrome 150, and headless
+    has no UI for Load-unpacked) but a debug-port Chrome is supervised — this makes plain
+    `fcdp <cmd>` work with no env var.
+
+    IPv6 first-class: a debug port often binds [::1] ONLY, which is exactly what made the
+    2026-07-29 probe look dead when checked on 127.0.0.1."""
+    import urllib.request
+    for base in ("http://127.0.0.1:9222", "http://[::1]:9222"):
+        try:
+            with urllib.request.urlopen(base + "/json/version", timeout=2):
+                return base
+        except Exception:
+            continue
+    return None
+
+
+# Resolve the transport EAGERLY. It must be known before argument parsing, because
+# tabId syntax differs per transport (bridge = chrome.tabs ints, direct = hex target
+# ids) and resolve_tid() runs long before the first Conn() is built.
+if not CDP_URL and not PIPE_SOCKET and not os.path.exists(SOCK):
+    # The _autodetect_cdp() fallback was REMOVED. Silently attaching to
+    # whatever listens on :9222 can land you in a headless test browser
+    # instead of your real one. With no bridge socket and no explicit transport pinned, stay in
+    # bridge mode: Conn fails loud ("bridge unavailable -- refusing to attach
+    # to a debug-port browser"). A lane whose OWN notes name a debug-port
+    # instance as its exception pins FCDP_CDP_URL explicitly -- that still works.
+    print("fcdp: bridge socket %s not found and no explicit transport pinned; "
+          "refusing to attach to a debug-port browser" % SOCK, file=sys.stderr)
+
+# A bridge tab id is a chrome.tabs integer; a direct target id is an unrelated hex
+# string. Reusing one cache file made switching transports silently aim a command at
+# the wrong browser. Keep the historical bridge cache path, but namespace direct
+# caches by endpoint. FCDP_TAB_CACHE remains the explicit per-job override.
+if CACHE_OVERRIDE:
+    CACHE = os.path.expanduser(CACHE_OVERRIDE)
+elif CDP_URL or PIPE_SOCKET:
+    endpoint = CDP_URL or ("pipe:" + PIPE_SOCKET)
+    endpoint_key = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12]
+    CACHE = os.path.expanduser("~/.cache/fcdp-tab-direct-%s" % endpoint_key)
+else:
+    CACHE = os.path.expanduser("~/.cache/fcdp-tab")
+
+BROWSER_TARGET = "browser"
+
+
+class DirectConn:
+    """Raw-CDP transport, interface-compatible with Conn.
+
+    Used when FCDP_CDP_URL points at a Chrome with --remote-debugging-port. Talks
+    HTTP for target discovery and one WebSocket per tab for commands, so no
+    extension and no bridge are involved.
+
+    Meta.* are bridge concepts, emulated here:
+      listTabs  -> GET /json/list           createTab -> PUT /json/new?url=
+      closeTab  -> GET /json/close/<id>     attach/detach -> no-ops (raw CDP has
+                   no debugger-arbitration; the port IS the attachment)
+    """
+    def __init__(self, timeout=120):
+        import urllib.request
+        self._url = urllib.request
+        self.base = CDP_URL
+        self.timeout = timeout
+        self.evq = []
+        self._ws = {}
+        self._id = 0
+        try:
+            self._http("/json/version")
+        except Exception as e:
+            die("FCDP_CDP_URL=%s is not answering (%s).\n"
+                "Is that Chrome running? Note IPv6: a debug port may bind [::1] only, "
+                "so try http://[::1]:<port>." % (self.base, e))
+
+    def _http(self, path):
+        with self._url.urlopen(self.base + path, timeout=15) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+
+    def _http_text(self, path):
+        # /json/close/<id> and /json/activate/<id> answer with a bare string
+        # ("Target is closing"), NOT JSON — json.loads() raises JSONDecodeError on
+        # them. Every close through this transport crashed with a traceback until
+        # this existed (found while pruning leaked tabs).
+        # Worse, the crash was MISLEADING: the HTTP close had already succeeded, so
+        # callers logged "FAILED" for tabs that were in fact closed.
+        # 404 = no such target, i.e. already closed. Closing is idempotent by
+        # nature and a pruner must be safe to re-run, so report it rather than raise.
+        try:
+            with self._url.urlopen(self.base + path, timeout=15) as r:
+                return r.read().decode("utf-8", "replace").strip()
+        except self._url.HTTPError as e:
+            if e.code == 404:
+                return "no such target (already closed)"
+            raise
+
+    def _pages(self):
+        return [t for t in self._http("/json/list") if t.get("type") == "page"]
+
+    def _sock(self, tabId):
+        key = str(tabId)
+        if key in self._ws:
+            return self._ws[key]
+        from websockets.sync.client import connect
+        if key == BROWSER_TARGET:
+            ws_url = self._http("/json/version").get("webSocketDebuggerUrl")
+            if not ws_url:
+                die("CDP endpoint %s does not advertise a browser WebSocket" % self.base)
+        else:
+            tgt = next((t for t in self._pages() if str(t.get("id")) == key), None)
+            if tgt is None:
+                die("no CDP target %s at %s (run `fcdp tabs` to list)" % (tabId, self.base))
+            ws_url = tgt["webSocketDebuggerUrl"]
+        ws = connect(ws_url, open_timeout=20,
+                     close_timeout=5, max_size=64 * 1024 * 1024)
+        self._ws[key] = ws
+        return ws
+
+    def _next(self):
+        self._id += 1
+        return self._id
+
+    def cmd(self, tabId, method, params=None, profile=None):
+        if profile is not None:
+            die("--profile applies only to the bridge transport; a direct-CDP endpoint is a single browser")
+        params = params or {}
+        if method == "Meta.listTabs":
+            return {"result": {"tabs": [{"tabId": t.get("id"), "url": t.get("url"),
+                                         "title": t.get("title")} for t in self._pages()]}}
+        if method == "Meta.createTab":
+            u = params.get("url") or "about:blank"
+            import urllib.parse, urllib.request as _u
+            req = _u.Request(self.base + "/json/new?" + urllib.parse.quote(u, safe=":/?&=#"),
+                             method="PUT")
+            with _u.urlopen(req, timeout=20) as r:
+                t = json.loads(r.read().decode("utf-8", "replace"))
+            return {"result": {"tabId": t.get("id")}}
+        if method == "Meta.closeTab":
+            self._ws.pop(str(tabId), None)  # drop the cached socket; target is going away
+            return {"result": {"closed": True,
+                               "note": self._http_text("/json/close/%s" % tabId)}}
+        if method in ("Meta.attach", "Meta.detach"):
+            # No arbitration in raw CDP — report success so callers behave identically.
+            return {"result": {"ok": True, "note": "no-op in direct-CDP mode"}}
+
+        if tabId is None:
+            pages = self._pages()
+            if not pages:
+                die("no page targets at %s" % self.base)
+            tabId = pages[0].get("id")
+        ws = self._sock(tabId)
+        cid = self._next()
+        ws.send(json.dumps({"id": cid, "method": method, "params": params}))
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            msg = json.loads(ws.recv(timeout=max(1, deadline - time.time())))
+            if msg.get("id") == cid:
+                return msg
+            if msg.get("method"):                      # CDP event
+                self.evq.append({"event": msg["method"], "tabId": tabId,
+                                 "params": msg.get("params", {})})
+        return {"error": {"message": "timeout waiting for %s" % method}}
+
+    def send_only(self, tabId, method, params=None):
+        self.cmd(tabId, method, params)
+
+    def subscribe(self, filter=None, tabId=None):
+        if tabId is None:
+            pages = self._pages()
+            tabId = pages[0].get("id") if pages else None
+        self._sub_tab = tabId
+        self._sock(tabId)
+        return {"result": {"subscribed": True}}
+
+    def collect(self, seconds, on_event=None):
+        """Drain buffered events, then read the socket for `seconds`. Mirrors
+        _BridgeConn.collect so event-driven commands behave the same either way."""
+        events = []
+        for f in self.evq:
+            events.append(f)
+            if on_event:
+                on_event(f)
+        self.evq = []
+        tabId = getattr(self, "_sub_tab", None) or next(iter(self._ws), None)
+        if tabId is None:
+            return events
+        ws = self._sock(tabId)
+        end = time.time() + seconds
+        while True:
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            try:
+                msg = json.loads(ws.recv(timeout=remaining))
+            except Exception:
+                break                                  # timeout or closed: done collecting
+            if msg.get("method"):
+                ev = {"event": msg["method"], "tabId": tabId, "params": msg.get("params", {})}
+                events.append(ev)
+                if on_event:
+                    on_event(ev)
+        return events
+
+    def close(self):
+        for ws in self._ws.values():
+            try:
+                ws.close()
+            except Exception:
+                pass
+        self._ws.clear()
+
+
+class _BridgeConn:
+    """One persistent Unix-socket connection to the bridge. Demuxes command
+    replies (have `id`) from CDP events (have `event`)."""
+    def __init__(self, timeout=120, sock_path=SOCK):
+        self.sock_path = sock_path
+        if not os.path.exists(sock_path):
+            die("bridge unavailable -- refusing to attach to a debug-port browser (bridge socket %s not found; restart the bridge (node bridge.mjs); fcdp never falls back to a debug-port browser)" % sock_path)
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.settimeout(timeout)
+        try:
+            self.s.connect(sock_path)
+        except Exception as e:
+            die("could not connect to bridge at %s (%s)" % (sock_path, e))
+        self.buf = b""
+        self.evq = []
+        self._id = 0
+
+    def _next(self):
+        self._id += 1
+        return self._id
+
+    def _send(self, obj):
+        body = json.dumps(obj).encode()
+        self.s.sendall(struct.pack("<I", len(body)) + body)
+
+    def _read_one(self):
+        while True:
+            if len(self.buf) >= 4:
+                n = struct.unpack("<I", self.buf[:4])[0]
+                if len(self.buf) >= 4 + n:
+                    frame = self.buf[4:4 + n]
+                    self.buf = self.buf[4 + n:]
+                    return json.loads(frame.decode("utf-8", "replace"))
+            d = self.s.recv(65536)
+            if not d:
+                return None
+            self.buf += d
+
+    def cmd(self, tabId, method, params=None, targetId=None, profile=None):
+        cid = self._next()
+        msg = {"id": cid, "method": method, "params": params or {}}
+        if targetId is not None:
+            msg["targetId"] = targetId
+        if tabId is not None:
+            msg["tabId"] = tabId
+        if profile is not None:
+            msg["profile"] = profile
+        self._send(msg)
+        while True:
+            f = self._read_one()
+            if f is None:
+                return {"error": {"message": "connection closed"}}
+            if f.get("id") == cid:
+                return f
+            if f.get("event"):
+                self.evq.append(f)
+
+    def send_only(self, tabId, method, params=None):
+        cid = self._next()
+        self._send({"id": cid, "tabId": tabId, "method": method, "params": params or {}})
+
+    def call_op(self, op, **fields):
+        """Bridge-level op (listProfiles / setLabel): the bridge answers these
+        itself from its connection table; frames carry an id like commands."""
+        cid = self._next()
+        msg = {"op": op, "id": cid}
+        msg.update(fields)
+        self._send(msg)
+        while True:
+            f = self._read_one()
+            if f is None:
+                return {"error": {"message": "connection closed"}}
+            if f.get("id") == cid:
+                return f
+            if f.get("event"):
+                self.evq.append(f)
+
+    def subscribe(self, filter=None, tabId=None):
+        self._send({"op": "subscribe", "filter": filter or [], "tabId": tabId})
+        return self._read_one()
+
+    def collect(self, seconds, on_event=None):
+        events = []
+        for f in self.evq:
+            events.append(f)
+            if on_event:
+                on_event(f)
+        self.evq = []
+        end = time.time() + seconds
+        while True:
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            r, _, _ = select.select([self.s], [], [], remaining)
+            if not r:
+                break
+            d = self.s.recv(65536)
+            if not d:
+                break
+            self.buf += d
+            while len(self.buf) >= 4:
+                n = struct.unpack("<I", self.buf[:4])[0]
+                if len(self.buf) < 4 + n:
+                    break
+                obj = json.loads(self.buf[4:4 + n].decode("utf-8", "replace"))
+                self.buf = self.buf[4 + n:]
+                if obj.get("event"):
+                    events.append(obj)
+                    if on_event:
+                        on_event(obj)
+        return events
+
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+
+
+def Conn(timeout=120):
+    """Select pipe, remote-debugging port, or real-profile extension transport."""
+    if PIPE_SOCKET:
+        return _BridgeConn(timeout, PIPE_SOCKET)
+    if CDP_URL:
+        return DirectConn(timeout)
+    return _BridgeConn(timeout)
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ---- profile targeting (bridge transport) -------------------------------------
+# Labels are Chrome directory names — one vocabulary across the extension and
+# the bridge. Aliases exist only at this CLI edge; rename them to taste.
+PROFILE_ALIASES = {
+    "personal": "Profile 1", "p1": "Profile 1", "1": "Profile 1", "profile 1": "Profile 1",
+    "work": "Profile 2", "p2": "Profile 2", "2": "Profile 2", "profile 2": "Profile 2",
+}
+DEFAULT_PROFILE = "Profile 1"
+
+
+def normalize_profile(value):
+    key = " ".join(str(value).strip().lower().replace("_", " ").split())
+    if key in PROFILE_ALIASES:
+        return PROFILE_ALIASES[key]
+    die("unknown profile %r (use personal|work or a directory name like 'Profile 2')" % value)
+
+
+def extract_profile_flag(args):
+    """Pull `--profile <x>` / `--profile=<x>` out of an arg list.
+    Returns (label_or_None, remaining_args)."""
+    out = []
+    label = None
+    i = 0
+    while i < len(args):
+        x = args[i]
+        if x == "--profile":
+            if i + 1 >= len(args):
+                die("--profile needs a value (personal|work|'Profile 2')")
+            label = normalize_profile(args[i + 1]); i += 2; continue
+        if x.startswith("--profile="):
+            label = normalize_profile(x.split("=", 1)[1]); i += 1; continue
+        out.append(x); i += 1
+    return label, out
+
+
+def show(r):
+    # The 8000-char cap keeps interactive output readable, but it SILENTLY emits invalid
+    # JSON — a programmatic consumer piping `fcdp raw ... | json.loads` just gets
+    # "Unexpected end of JSON input" with nothing pointing at the cap. (Cost a debugging
+    # cycle 2026-07-29 porting caltrans-pra capture-session.mjs off the removed :9222.)
+    # Default behavior is unchanged; FCDP_FULL=1 opts into complete output, and any
+    # truncation now announces itself on STDERR so it can't corrupt piped JSON.
+    out = json.dumps(r, indent=2)
+    if os.environ.get("FCDP_FULL") == "1" or len(out) <= 8000:
+        print(out)
+        return
+    print(out[:8000])
+    print(
+        "fcdp: output truncated at 8000 chars (%d total) — this JSON is INCOMPLETE. "
+        "Set FCDP_FULL=1 for the full payload." % len(out),
+        file=sys.stderr,
+    )
+
+
+def result_or_die(r, what):
+    if isinstance(r, dict) and r.get("error"):
+        die("%s failed: %s" % (what, r["error"].get("message")))
+    return r.get("result", {}) if isinstance(r, dict) else r
+
+
+def _canon_url(u):
+    """Apply Chrome's OWN canonicalization so `open --reuse` can compare exactly.
+
+    Chrome reports a path-less url with the path filled in: `fcdp open https://example.com`
+    produces a tab whose url is `https://example.com/`. A raw string compare therefore never
+    matches the very case people type, and reuse would silently never fire. This normalizes
+    ONLY that — it does not lowercase, strip queries/fragments, or collapse a real trailing
+    slash (`/a/` vs `/a` stay different), because matching two different pages would navigate
+    a tab the caller never asked about.
+    """
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        s = urlsplit(u)
+        if s.scheme in ("http", "https") and s.netloc and s.path == "":
+            return urlunsplit((s.scheme, s.netloc, "/", s.query, s.fragment))
+    except Exception:
+        pass
+    return u
+
+
+# ---- tab cache so tabId is optional on every command --------------------------
+def save_tab(tid):
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        open(CACHE, "w").write(str(tid))
+    except Exception:
+        pass
+
+
+def cached_tab():
+    try:
+        v = open(CACHE).read().strip()
+    except Exception:
+        return None
+    if not v:
+        return None
+    return int(v) if v.isdigit() else v          # direct-CDP ids are hex strings
+
+
+def _is_tid(s):
+    """Bridge tab ids are chrome.tabs integers; direct-CDP target ids are 32-char
+    uppercase hex. Accept hex ONLY in direct mode so a hex-looking argument can't be
+    mistaken for a tabId when talking to the bridge."""
+    if re.fullmatch(r"\d+", s):
+        return True
+    return bool(CDP_URL or PIPE_SOCKET) and (
+        s == BROWSER_TARGET or bool(re.fullmatch(r"[0-9A-Fa-f]{16,}", s))
+    )
+
+
+def resolve_tid(a, idx):
+    """Return (tabId, remaining_args). Uses a[idx] if it looks like a tab id for the
+    active transport, else the cached tab."""
+    if len(a) > idx and _is_tid(a[idx]):
+        v = a[idx]
+        return (int(v) if v.isdigit() else v), a[idx + 1:]
+    t = cached_tab()
+    if t is None and CDP_URL:
+        # Direct mode has no `fcdp open` history to seed the cache, and a freshly
+        # provisioned host therefore failed EVERY command with
+        # "no tabId given and none cached" — breaking this tool's stated contract that
+        # "tabId is OPTIONAL on every command". The debug port already enumerates its
+        # targets, so fall back to the first page rather than dying.
+        try:
+            import urllib.request
+            with urllib.request.urlopen(CDP_URL + "/json/list", timeout=5) as r:
+                pages = [x for x in json.loads(r.read().decode("utf-8", "replace"))
+                         if x.get("type") == "page"]
+            if pages:
+                t = pages[0].get("id")
+        except Exception:
+            pass
+    if t is None and PIPE_SOCKET:
+        try:
+            conn = _BridgeConn(5, PIPE_SOCKET)
+            reply = conn.cmd(None, "Meta.listTabs")
+            conn.close()
+            tabs = reply.get("result", {}).get("tabs", [])
+            if tabs:
+                t = tabs[0].get("tabId")
+        except Exception:
+            pass
+    if t is None:
+        die("no tabId given and none cached — run `fcdp open <url>` first, or pass a tabId"
+            + ("\n(direct-CDP mode: `fcdp tabs` lists hex target ids)" if CDP_URL else ""))
+    return t, a[idx:]
+
+
+def evalv(conn, tid, expr):
+    # replMode:True lets a snippet re-declare `const`/`let` on a repeat call instead of
+    # throwing "Identifier 'x' has already been declared". The page's default execution
+    # context persists across evaluate calls (REPL semantics); replMode is how DevTools'
+    # own console tolerates it. (Verified against Claude-for-Chrome's CDP driver, 2026-07-12.)
+    r = conn.cmd(tid, "Runtime.evaluate",
+                 {"expression": expr, "returnByValue": True, "awaitPromise": True, "replMode": True})
+    res = result_or_die(r, "Runtime.evaluate")
+    return res.get("result", {}).get("value")
+
+
+def click_at(conn, tid, x, y):
+    for typ in ("mousePressed", "mouseReleased"):
+        conn.cmd(tid, "Input.dispatchMouseEvent",
+                 {"type": typ, "x": int(x), "y": int(y), "button": "left", "clickCount": 1})
+
+
+KEYS = {
+    "Enter": ("Enter", "Enter", 13, "\r"), "Return": ("Enter", "Enter", 13, "\r"),
+    "Tab": ("Tab", "Tab", 9, None), "Escape": ("Escape", "Escape", 27, None), "Esc": ("Escape", "Escape", 27, None),
+    "Backspace": ("Backspace", "Backspace", 8, None), "Delete": ("Delete", "Delete", 46, None),
+    "ArrowUp": ("ArrowUp", "ArrowUp", 38, None), "ArrowDown": ("ArrowDown", "ArrowDown", 40, None),
+    "ArrowLeft": ("ArrowLeft", "ArrowLeft", 37, None), "ArrowRight": ("ArrowRight", "ArrowRight", 39, None),
+    "Space": (" ", "Space", 32, " "),
+}
+
+
+def press_key(conn, tid, name):
+    k = KEYS.get(name) or KEYS.get(name.capitalize())
+    if not k:
+        die("unknown key: %s (known: %s)" % (name, ", ".join(sorted(KEYS))))
+    key, code, vk, text = k
+    down = {"type": "keyDown", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+    if text:
+        down["text"] = text
+    conn.cmd(tid, "Input.dispatchKeyEvent", down)
+    conn.cmd(tid, "Input.dispatchKeyEvent",
+             {"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+
+
+HELP = """fcdp - ONE CLI for your REAL Chrome (our MV3 extension via chrome.debugger)
+
+TABS / NAV:
+  fcdp tabs [--profile <p>]       list tabs -> profile,tabId,url,title
+  fcdp profiles                   list connected profiles (label, conn, tab count)
+  fcdp open <url> [--bg] [--reuse] [--profile <p>]
+                                  open a NEW tab (cached as active); --bg = background
+                                  --reuse: if a tab already has this exact url,
+                                  Page.navigate it instead of opening a duplicate
+                                  (ignored with --bg, which always creates)
+  --profile <p>: personal|work|'Profile 1'|'Profile 2' — open/tabs target that
+                                  profile; open DEFAULTS to Profile 1 (personal).
+                                  TabId commands need no flag: the bridge routes
+                                  each tabId to the profile that owns the tab.
+  fcdp label <conn> <Profile N>   one-time setup: persist a profile label on the
+                                  connection shown by `fcdp profiles`
+  fcdp nav [tab] <url>            navigate the tab (CDP Page.navigate)
+  fcdp tabsnav [tab] <url>        navigate via chrome.tabs.update (debugger-free; heals a tab whose create-time navigation never committed)
+  fcdp close [tab]                close the tab
+
+READ:
+  fcdp read [tab]                 interactive-element outline (role/text/coords) + title/url
+  fcdp snap [tab] [--max N]       compact a11y-style refs for agents (@1..@N); token-cheap
+  fcdp text [tab]                 page innerText
+  fcdp find [tab] "<css|text>"    matching elements -> tag,text,center x,y
+  fcdp shot [tab] [file.png]      screenshot (Page.captureScreenshot)
+
+AGENT HARNESS (Aside-inspired; still CDP under the hood — no Playwright):
+  fcdp viewport [tab] [W H]       lock agent viewport (default 1440 900); use on --bg tabs
+  Prefer: open --bg → viewport → snap → click/fill @N → close. Keep raw CDP for ops/debug.
+
+INTERACT:
+  fcdp click [tab] <css|text|x,y|@N>  click by selector/text/coords OR snap ref (@3)
+  fcdp type [tab] "<text>"        type at the focused element (Input.insertText)
+  fcdp fill [tab] <css|@N> "<value>"  set input value by selector OR snap ref
+  fcdp key  [tab] <Key>           press a key (Enter, Tab, Escape, ArrowDown, ...)
+  fcdp scroll [tab] <up|down|left|right> [n]
+  fcdp js  [tab] "<code>"         Runtime.evaluate (returnByValue, awaitPromise)
+  fcdp console [tab] [secs] [--reload]   collect console logs/errors/exceptions
+  fcdp network [tab] [secs] [--reload]   collect requests: status, method, URL, failures
+  fcdp wait [tab] "<jsExpr>" [ms] poll until truthy
+
+FULL-CDP POWER (the 4 domains ccb CANNOT do):
+  fcdp pdf [tab] [out.pdf]        Page.printToPDF -> real PDF
+  fcdp intercept [tab] [secs]     Fetch.enable + reload; log & continue paused requests
+  fcdp throttle [tab]             Network.emulateNetworkConditions Slow-3G
+  fcdp trace [tab] [out.json]     Tracing.start/end -> trace file
+  fcdp raw [tab] <CDP.Method> ['<json>']   any page-target CDP call
+  fcdp raw --browser <CDP.Method> ['<json>']
+                                  browser-target call (direct mode only)
+  fcdp attach|detach [tab]
+
+tabId is optional everywhere (omit to use the last `fcdp open`ed tab).
+"""
+
+# JS snippets (SEL / VAL substituted with json.dumps'd literals)
+_FIND = r"""(function(sel){var els=[];try{els=Array.prototype.slice.call(document.querySelectorAll(sel));}catch(e){els=[];}
+if(!els.length){var all=document.querySelectorAll('a,button,input,select,textarea,[role],summary,label');
+for(var i=0;i<all.length;i++){var t=(all[i].textContent||all[i].value||'').trim();if(t&&t.toLowerCase().indexOf(String(sel).toLowerCase())>-1)els.push(all[i]);}}
+return els.slice(0,25).map(function(el){var r=el.getBoundingClientRect();return {tag:el.tagName,text:(el.textContent||el.value||'').trim().slice(0,60),x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),w:Math.round(r.width),h:Math.round(r.height)};});})"""
+
+_CENTER = r"""(function(sel){var el=null;try{el=document.querySelector(sel);}catch(e){}
+if(!el){var cand=document.querySelectorAll('a,button,[role=button],[role=link],[role=tab],[role=menuitem],input,select,textarea,summary,label,[onclick]');
+var q=String(sel).toLowerCase(),best=null,bestLen=1e9;
+for(var i=0;i<cand.length;i++){var t=(cand[i].getAttribute('aria-label')||cand[i].textContent||cand[i].value||'').trim();
+if(t&&t.toLowerCase().indexOf(q)>-1&&t.length<bestLen){best=cand[i];bestLen=t.length;}}el=best;}
+if(!el)return null;el.scrollIntoView({block:'center'});var r=el.getBoundingClientRect();
+return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),tag:el.tagName,text:(el.textContent||el.value||'').trim().slice(0,50)};})"""
+
+_FILL = r"""(function(sel,val){var el=document.querySelector(sel);if(!el)return {ok:false,err:'not found: '+sel};
+el.focus();var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
+var setter=Object.getOwnPropertyDescriptor(proto,'value').set;setter.call(el,val);
+el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));
+return {ok:true,value:el.value};})"""
+
+_READ = r"""(function(){var all=document.querySelectorAll('a,button,input,select,textarea,[role],summary,[onclick]');var out=[];
+for(var i=0;i<all.length&&out.length<80;i++){var el=all[i];var r=el.getBoundingClientRect();if(r.width===0||r.height===0)continue;
+var t=(el.getAttribute('aria-label')||el.textContent||el.value||el.placeholder||'').trim().slice(0,60);
+out.push(el.tagName.toLowerCase()+(el.type?('['+el.type+']'):'')+' "'+t+'" @'+Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2));}
+return {title:document.title,url:location.href,interactive:out};})()"""
+
+
+
+_SNAP = r"""(function(maxN){maxN=maxN||40;
+document.querySelectorAll('[data-fcdp-ref]').forEach(function(el){ el.removeAttribute('data-fcdp-ref'); });
+var sels='a,button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=textbox],[role=combobox],[onclick],[contenteditable=true]';
+var all=document.querySelectorAll(sels);
+var items=[], seen={};
+function roleOf(el){
+  var r=el.getAttribute('role'); if(r) return r;
+  var t=el.tagName.toLowerCase();
+  if(t==='a') return 'link';
+  if(t==='button') return 'button';
+  if(t==='select') return 'combobox';
+  if(t==='textarea') return 'textbox';
+  if(t==='input'){ var ty=(el.type||'text').toLowerCase();
+    if(ty==='checkbox'||ty==='radio') return ty;
+    if(ty==='submit'||ty==='button') return 'button';
+    return 'textbox'; }
+  return t;
+}
+function labelOf(el){
+  var t=(el.getAttribute('aria-label')||el.getAttribute('placeholder')||el.getAttribute('name')||el.getAttribute('title')||'');
+  if(!t){ var id=el.id; if(id){ try{ var lab=document.querySelector('label[for="'+String(id).replace(/"/g,'\\"')+'"]'); if(lab) t=lab.textContent||''; }catch(e){} } }
+  if(!t) t=el.textContent||el.value||'';
+  return String(t).replace(/\s+/g,' ').trim().slice(0,48);
+}
+for(var i=0;i<all.length && items.length<maxN;i++){
+  var el=all[i];
+  var r=el.getBoundingClientRect();
+  if(r.width<2||r.height<2) continue;
+  if(r.bottom<0||r.top>(innerHeight||0)||r.right<0||r.left>(innerWidth||0)) continue;
+  var st=getComputedStyle(el); if(st.visibility==='hidden'||st.display==='none'||Number(st.opacity)===0) continue;
+  var key=el.tagName+'|'+Math.round(r.left)+'|'+Math.round(r.top)+'|'+labelOf(el);
+  if(seen[key]) continue; seen[key]=1;
+  var ref=items.length+1;
+  el.setAttribute('data-fcdp-ref', String(ref));
+  items.push({ref:ref, role:roleOf(el), name:labelOf(el), tag:el.tagName.toLowerCase(),
+    type:el.type||null, focused:(document.activeElement===el),
+    x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2),
+    w:Math.round(r.width), h:Math.round(r.height)});
+}
+window.__fcdpSnap={at:Date.now(), url:location.href, items:items};
+return {title:document.title, url:location.href, count:items.length, items:items};
+})"""
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(HELP)
+        return
+    c = a[0]
+
+    if c == "tabs":
+        profile, _rest = extract_profile_flag(a[1:])
+        conn = Conn(); r = conn.cmd(None, "Meta.listTabs", profile=profile); conn.close()
+        res = result_or_die(r, "Meta.listTabs")
+        for t in res.get("tabs", []):
+            print("%s\t%s\t%s\t%s" % (t.get("profile") or "-", t.get("tabId"), (t.get("url") or "")[:70], (t.get("title") or "")[:40]))
+        if res.get("attached"):
+            print("# attached tabs: %s" % res["attached"], file=sys.stderr)
+        return
+
+    if c == "profiles":
+        conn = Conn()
+        if not isinstance(conn, _BridgeConn):
+            conn.close(); die("fcdp profiles applies only to the bridge transport")
+        r = conn.call_op("listProfiles"); conn.close()
+        res = result_or_die(r, "listProfiles")
+        for p in res.get("profiles", []):
+            print("conn %s\t%s\ttabs: %s" % (p.get("conn"), p.get("label") or "(unlabeled)", p.get("tabCount")))
+            for t in p.get("tabSample", []):
+                print("    %s" % (t.get("url") or "")[:90])
+        return
+
+    if c == "label":
+        if len(a) < 3:
+            die("usage: fcdp label <conn> <Profile N>  (conn ids come from `fcdp profiles`)")
+        try:
+            conn_id = int(a[1])
+        except ValueError:
+            die("fcdp label: <conn> must be the numeric connection id from `fcdp profiles`")
+        label = normalize_profile(" ".join(a[2:]))
+        conn = Conn()
+        if not isinstance(conn, _BridgeConn):
+            conn.close(); die("fcdp label applies only to the bridge transport")
+        r = conn.call_op("setLabel", conn=conn_id, label=label); conn.close()
+        show(r)
+        if isinstance(r, dict) and r.get("error"):
+            sys.exit(1)
+        return
+
+    if c == "open":
+        profile, rest = extract_profile_flag(a[1:])
+        # Deterministic targeting: open ALWAYS names its profile.
+        # The pre-multi-profile bridge routed creates to whichever profile was
+        # last active; the default is the configured default profile, never
+        # "last active". --profile names another profile explicitly. All before/after/reuse/anchor logic below is
+        # scoped to the target profile's tabs.
+        profile = profile or DEFAULT_PROFILE
+        url = None
+        bg = "--bg" in rest
+        reuse = "--reuse" in rest
+        for x in rest:
+            if x not in ("--bg", "--reuse"):
+                url = x; break
+        url = url or "about:blank"
+        conn = Conn()
+        # Profile routing exists only on the real bridge (standard socket).
+        # Direct-CDP / pipe transports are single-browser: no profile is sent,
+        # and their historical behavior is unchanged.
+        prof_arg = profile if (isinstance(conn, _BridgeConn) and conn.sock_path == SOCK) else None
+        tabs_before = result_or_die(conn.cmd(None, "Meta.listTabs", profile=prof_arg), "Meta.listTabs").get("tabs", [])
+        before = {t["tabId"] for t in tabs_before}
+        # --reuse: `open` has ALWAYS created a new tab, so an agent that opens the same
+        # page across a long session accumulates duplicates monotonically (a real profile
+        # reached 139 tabs / 35 exact dupes — one report open 6x). tabs_before already
+        # carries every tab's url; we were only diffing its ids. Opt-in, because crons and
+        # scripts depend on bare `open` creating a tab every time.
+        #
+        # Page.navigate, NOT a bare activate: re-opening the same file:// URL after
+        # regenerating the file must show the NEW bytes. Activating a stale tab is exactly
+        # the false-verification bug this flag exists to avoid — and Meta has no activate
+        # op anyway (the extension implements listTabs/attach/detach/createTab/closeTab,
+        # nothing else). Checked BEFORE Meta.createTab, so neither create path — native or
+        # the window.open fallback below — can run once a match is found.
+        #
+        # KNOWN LIMIT (measured, not theoretical): chrome.tabs reports a tab whose
+        # navigation has not COMMITTED yet with an empty/pending url, so a --reuse issued
+        # within ~1s of opening that same url on a cold load finds no match and creates a
+        # second tab. Matching the pending url would need a field Meta.listTabs does not
+        # send, and this stays CLI-side by design. Harmless for the actual case (a tab
+        # opened earlier is long committed); do not "fix" it with a sleep here.
+        if reuse and not bg:
+            want = _canon_url(url)
+            hit = next((t for t in tabs_before
+                        if _canon_url(t.get("url") or "") == want), None)
+            if hit:
+                tid = hit["tabId"]
+                conn.cmd(tid, "Page.enable")
+                r = conn.cmd(tid, "Page.navigate", {"url": url})
+                conn.close()
+                result_or_die(r, "Page.navigate")
+                save_tab(tid)
+                print("reused tab %s (cached active, re-navigated)" % tid)
+                return
+        # Prefer the native chrome.tabs op (active once the extension is reloaded);
+        # else fall back to window.open on an existing tab — pure CDP, no reload needed.
+        r = conn.cmd(None, "Meta.createTab", {"url": url, "active": not bg}, profile=prof_arg)
+        tid = r.get("result", {}).get("tabId") if isinstance(r, dict) else None
+        if not tid:
+            # Anchor on a NORMAL page (chrome:// restricts window.open); userGesture beats the popup blocker.
+            anchor = None
+            for t in tabs_before:
+                if (t.get("url") or "").startswith(("http://", "https://", "file:")):
+                    anchor = t["tabId"]; break
+            if anchor is None and tabs_before:
+                anchor = tabs_before[0]["tabId"]
+            if anchor is None:
+                conn.close(); die("no tab to anchor window.open — open any http page in Chrome first")
+            conn.cmd(anchor, "Runtime.evaluate",
+                     {"expression": "window.open(%s,'_blank')" % json.dumps(url), "userGesture": True})
+            time.sleep(0.8)
+            after = result_or_die(conn.cmd(None, "Meta.listTabs", profile=prof_arg), "Meta.listTabs").get("tabs", [])
+            new = [t for t in after if t["tabId"] not in before]
+            tid = new[0]["tabId"] if new else None
+        conn.close()
+        if not tid:
+            die("could not open a new tab")
+        # Surface the extension's create-time navigation guard (2026-11-11):
+        # a healed or still-uncommitted create must be visible in job logs,
+        # never a silent doomed tab.
+        _res = r.get("result", {}) if isinstance(r, dict) else {}
+        if _res.get("committed") is not None and (_res.get("healed") not in (None, "none") or _res.get("committed") is False):
+            print("# fcdp create-guard: committed=%s healed=%s" % (_res.get("committed"), _res.get("healed")), file=sys.stderr)
+        save_tab(tid)
+        print("tabId %s (cached active)%s" % (tid, (" [%s]" % profile) if prof_arg else ""))
+        return
+
+    if c in ("attach", "detach"):
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn(); r = conn.cmd(tid, "Meta.attach" if c == "attach" else "Meta.detach"); conn.close()
+        show(r); return
+
+    if c == "close":
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn()
+        r = conn.cmd(tid, "Meta.closeTab")
+        if isinstance(r, dict) and r.get("error"):
+            # pre-reload extension has no Meta.closeTab — window.close() (works for script-opened tabs)
+            conn.cmd(tid, "Runtime.evaluate", {"expression": "window.close()"})
+            r = {"result": {"closed": True, "tabId": tid, "via": "window.close"}}
+        conn.close(); show(r); return
+
+    if c == "raw":
+        if len(a) > 1 and a[1] == "--browser":
+            if not (CDP_URL or PIPE_SOCKET):
+                die(
+                    "raw --browser requires direct mode (set FCDP_CDP_URL or "
+                    "FCDP_PIPE_SOCKET). "
+                    "Stock Chrome's extension API intentionally withholds browser-level "
+                    "and privileged domains from the real Default profile."
+                )
+            tid, rest = BROWSER_TARGET, a[2:]
+        else:
+            tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die("usage: fcdp raw [tab|--browser] <CDP.Method> ['<json>']")
+        method = rest[0]; params = json.loads(rest[1]) if len(rest) > 1 else {}
+        conn = Conn(); r = conn.cmd(tid, method, params); conn.close()
+        show(r)
+        if isinstance(r, dict) and r.get("error"):
+            sys.exit(1)
+        return
+
+    if c == "js":
+        tid, rest = resolve_tid(a, 1)
+        code = " ".join(rest)
+        conn = Conn()
+        # replMode:True → snippets may re-declare const/let across calls without the
+        # "already been declared" collision (see evalv). You no longer need to wrap
+        # every snippet in an IIFE. (Ported from Claude-for-Chrome, verified 2026-07-12.)
+        r = conn.cmd(tid, "Runtime.evaluate",
+                     {"expression": code, "returnByValue": True, "awaitPromise": True, "replMode": True})
+        conn.close()
+        res = result_or_die(r, "Runtime.evaluate")
+        rv = res.get("result", {})
+        if "value" in rv:
+            print(json.dumps(rv["value"], indent=2) if not isinstance(rv["value"], str) else rv["value"])
+        else:
+            show(res)
+        return
+
+    if c == "nav":
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die("usage: fcdp nav [tab] <url>")
+        conn = Conn(); conn.cmd(tid, "Page.enable")
+        r = conn.cmd(tid, "Page.navigate", {"url": rest[0]}); conn.close()
+        save_tab(tid); show(r); return
+
+    if c == "tabsnav":
+        # Debugger-free navigation (extension Meta.navigateTab ->
+        # chrome.tabs.update). The heal for a tab whose create-time
+        # navigation never committed: Runtime.evaluate cannot run on an
+        # uncommitted tab and Page.navigate needs a live debugger target;
+        # tabs.update needs neither.
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die("usage: fcdp tabsnav [tab] <url>")
+        conn = Conn(); r = conn.cmd(tid, "Meta.navigateTab", {"url": rest[0]}); conn.close()
+        save_tab(tid); show(r)
+        if isinstance(r, dict) and r.get("error"):
+            sys.exit(1)
+        return
+
+    if c == "text":
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn()
+        v = evalv(conn, tid, "document.body ? document.body.innerText : ''")
+        conn.close()
+        print((v or "")[:8000]); return
+
+    if c == "read":
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn(); v = evalv(conn, tid, _READ); conn.close()
+        if not isinstance(v, dict):
+            die("read failed: %s" % json.dumps(v)[:300])
+        print("%s\n%s" % (v.get("title"), v.get("url")))
+        for line in v.get("interactive", []):
+            print("  " + line)
+        return
+
+    if c == "snap":
+        # Compact agent-facing snapshot (Aside-style refs) without Playwright.
+        tid, rest = resolve_tid(a, 1)
+        max_n = 40
+        if "--max" in rest:
+            i = rest.index("--max")
+            if i + 1 >= len(rest):
+                die("usage: fcdp snap [tab] [--max N]")
+            max_n = int(rest[i + 1])
+        conn = Conn()
+        v = evalv(conn, tid, _SNAP + "(%d)" % max_n)
+        conn.close()
+        if not isinstance(v, dict):
+            die("snap failed: %s" % json.dumps(v)[:300])
+        # Persist refs for click/fill @N (survives across CLI invocations)
+        snap_path = "/tmp/fcdp-snap-%s.json" % tid
+        json.dump({"tid": tid, "url": v.get("url"), "items": v.get("items") or []}, open(snap_path, "w"))
+        print("%s" % v.get("title"))
+        print("%s" % v.get("url"))
+        print("# %d refs  (click/fill @N)  saved %s" % (v.get("count") or 0, snap_path))
+        for it in (v.get("items") or []):
+            focus = "*" if it.get("focused") else " "
+            name = (it.get("name") or "").replace("\n", " ")
+            print("@%d%s %s %s" % (it["ref"], focus, it.get("role") or "?", name))
+        return
+
+    if c == "viewport":
+        # Lock agent viewport (Aside uses 1440x900 for CUA/training alignment).
+        tid, rest = resolve_tid(a, 1)
+        w = int(rest[0]) if len(rest) >= 1 else 1440
+        h = int(rest[1]) if len(rest) >= 2 else 900
+        conn = Conn()
+        r = conn.cmd(tid, "Emulation.setDeviceMetricsOverride", {
+            "width": w, "height": h, "deviceScaleFactor": 1, "mobile": False,
+        })
+        conn.close()
+        result_or_die(r, "Emulation.setDeviceMetricsOverride")
+        print("viewport %dx%d on tab %s" % (w, h, tid))
+        return
+
+    if c == "find":
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die('usage: fcdp find [tab] "<css|text>"')
+        sel = " ".join(rest)
+        conn = Conn(); v = evalv(conn, tid, _FIND + "(" + json.dumps(sel) + ")"); conn.close()
+        print(json.dumps(v, indent=2)); return
+
+    if c == "click":
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die('usage: fcdp click [tab] <css|text|x,y|@N>')
+        arg = " ".join(rest)
+        conn = Conn()
+        m = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*", arg)
+        if m:
+            click_at(conn, tid, int(m.group(1)), int(m.group(2)))
+            conn.close(); print("clicked %s,%s" % (m.group(1), m.group(2))); return
+        mref = re.fullmatch(r"\s*@(\d+)\s*", arg)
+        if mref:
+            snap_path = "/tmp/fcdp-snap-%s.json" % tid
+            try:
+                snap = json.load(open(snap_path))
+            except Exception:
+                conn.close(); die("no snap for tab %s — run: fcdp snap %s" % (tid, tid))
+            ref = int(mref.group(1))
+            it = next((x for x in snap.get("items") or [] if x.get("ref") == ref), None)
+            if not it:
+                conn.close(); die("unknown ref @%d (snap has %d)" % (ref, len(snap.get("items") or [])))
+            # Prefer DOM click on stamped node (works on --bg tabs); coords as fallback.
+            hit = evalv(conn, tid, """(function(ref){var el=document.querySelector('[data-fcdp-ref="'+ref+'"]');
+if(!el) return {ok:false,err:'missing stamp'}; el.scrollIntoView({block:'center'});
+if(typeof el.click==='function') el.click();
+return {ok:true,tag:el.tagName,href:el.href||null,name:(el.getAttribute('aria-label')||el.textContent||'').trim().slice(0,60)};})(%d)""" % ref)
+            if not (isinstance(hit, dict) and hit.get("ok")):
+                click_at(conn, tid, int(it["x"]), int(it["y"]))
+                conn.close()
+                print("clicked @%d %s \"%s\" @%d,%d (coord-fallback)" % (ref, it.get("role"), it.get("name"), it["x"], it["y"]))
+                return
+            conn.close()
+            print("clicked @%d %s \"%s\"%s" % (ref, it.get("role"), it.get("name"), (" -> "+hit["href"]) if hit.get("href") else ""))
+            return
+        ctr = evalv(conn, tid, _CENTER + "(" + json.dumps(arg) + ")")
+        if not ctr:
+            conn.close(); die("no element matched: %s" % arg)
+        click_at(conn, tid, ctr["x"], ctr["y"])
+        conn.close()
+        print("clicked <%s> \"%s\" @%d,%d" % (ctr.get("tag"), ctr.get("text"), ctr["x"], ctr["y"])); return
+
+    if c == "type":
+        tid, rest = resolve_tid(a, 1)
+        conn = Conn(); r = conn.cmd(tid, "Input.insertText", {"text": " ".join(rest)}); conn.close()
+        result_or_die(r, "Input.insertText"); print("typed %d chars" % len(" ".join(rest))); return
+
+    if c == "fill":
+        tid, rest = resolve_tid(a, 1)
+        if len(rest) < 2:
+            die('usage: fcdp fill [tab] <css|@N> "<value>"')
+        sel = rest[0]; val = " ".join(rest[1:])
+        conn = Conn()
+        mref = re.fullmatch(r"@(\d+)", sel)
+        if mref:
+            snap_path = "/tmp/fcdp-snap-%s.json" % tid
+            try:
+                snap = json.load(open(snap_path))
+            except Exception:
+                conn.close(); die("no snap for tab %s — run: fcdp snap %s" % (tid, tid))
+            ref = int(mref.group(1))
+            it = next((x for x in snap.get("items") or [] if x.get("ref") == ref), None)
+            if not it:
+                conn.close(); die("unknown ref @%d" % ref)
+            v = evalv(conn, tid, """(function(ref,val){var el=document.querySelector('[data-fcdp-ref="'+ref+'"]');
+if(!el) return {ok:false,err:'missing stamp'};
+el.focus(); var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
+var setter=Object.getOwnPropertyDescriptor(proto,'value'); if(setter&&setter.set){setter.set.call(el,val);} else {el.value=val;}
+el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true}));
+return {ok:true,tag:el.tagName,ref:Number(ref)};})(%s,%s)""" % (json.dumps(str(ref)), json.dumps(val)))
+            conn.close()
+            print(json.dumps({"ok": bool(isinstance(v, dict) and v.get("ok")), "ref": ref, "chars": len(val)})); return
+        v = evalv(conn, tid, _FILL + "(" + json.dumps(sel) + "," + json.dumps(val) + ")")
+        conn.close()
+        # Never echo filled values (password-safe)
+        if isinstance(v, dict) and "value" in v:
+            v = {k: v[k] for k in v if k != "value"}; v["chars"] = len(val)
+        print(json.dumps(v)); return
+
+    if c == "key":
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die("usage: fcdp key [tab] <KeyName>")
+        conn = Conn(); press_key(conn, tid, rest[0]); conn.close()
+        print("pressed %s" % rest[0]); return
+
+    if c == "scroll":
+        tid, rest = resolve_tid(a, 1)
+        direction = rest[0] if rest else "down"
+        n = int(rest[1]) if len(rest) > 1 else 3
+        dx, dy = 0, 0
+        step = 400 * n
+        if direction == "down": dy = step
+        elif direction == "up": dy = -step
+        elif direction == "right": dx = step
+        elif direction == "left": dx = -step
+        conn = Conn(); evalv(conn, tid, "window.scrollBy(%d,%d); [scrollX,scrollY]" % (dx, dy)); conn.close()
+        print("scrolled %s %d" % (direction, n)); return
+
+    if c in ("shot", "screenshot"):
+        tid, rest = resolve_tid(a, 1)
+        out = rest[0] if rest else os.path.expanduser("~/Downloads/fcdp-shot.png")
+        conn = Conn()
+        r = conn.cmd(tid, "Page.captureScreenshot", {"format": "png"}); conn.close()
+        res = result_or_die(r, "Page.captureScreenshot")
+        data = res.get("data")
+        if not data:
+            die("no screenshot data")
+        open(out, "wb").write(base64.b64decode(data))
+        print("wrote %s" % out); return
+
+    if c == "wait":
+        tid, rest = resolve_tid(a, 1)
+        expr = rest[0] if rest else "true"
+        timeout_ms = int(rest[1]) if len(rest) > 1 else 15000
+        deadline = timeout_ms / 1000.0
+        conn = Conn()
+        elapsed = 0.0
+        while elapsed <= deadline:
+            v = evalv(conn, tid, "!!(" + expr + ")")
+            if v is True:
+                conn.close(); print("ready after ~%.1fs" % elapsed); return
+            time.sleep(0.5); elapsed += 0.5
+        conn.close(); die("timed out after %.0fs waiting for: %s" % (deadline, expr), 1)
+
+    if c == "pdf":
+        tid, rest = resolve_tid(a, 1)
+        out = rest[0] if rest else "/tmp/fcdp-%s.pdf" % tid
+        conn = Conn(); conn.cmd(tid, "Page.enable")
+        r = conn.cmd(tid, "Page.printToPDF", {"printBackground": True, "landscape": False}); conn.close()
+        res = result_or_die(r, "Page.printToPDF")
+        data = res.get("data")
+        if not data:
+            die("Page.printToPDF returned no data: %s" % json.dumps(res)[:400])
+        raw = base64.b64decode(data)
+        open(out, "wb").write(raw)
+        print("wrote %s (%d bytes)" % (out, len(raw))); return
+
+    if c == "intercept":
+        # Same tabId/duration ambiguity as console/network: `fcdp intercept 6`
+        # reads 6 as a TAB ID (resolve_tid accepts any digit-string), silently
+        # targeting a nonexistent tab. `--secs N` is the unambiguous form;
+        # `fcdp intercept <tabId> <secs>` keeps working. (Fixed 2026-08-01.)
+        argv = a[1:]
+        secs = 6.0
+        if "--secs" in argv:
+            i = argv.index("--secs")
+            try:
+                secs = float(argv[i + 1])
+            except (IndexError, ValueError):
+                die("--secs needs a number, e.g. `fcdp intercept --secs 8`")
+            del argv[i:i + 2]
+        a = [a[0]] + argv
+        tid, rest = resolve_tid(a, 1)
+        if rest:
+            try:
+                secs = float(rest[0])
+            except ValueError:
+                pass
+        conn = Conn()
+        conn.subscribe(filter=["Fetch.requestPaused"], tabId=tid)
+        result_or_die(conn.cmd(tid, "Fetch.enable", {"patterns": [{"urlPattern": "*"}]}), "Fetch.enable")
+        conn.cmd(tid, "Page.enable"); conn.send_only(tid, "Page.reload", {"ignoreCache": True})
+        seen = []
+
+        def on_ev(f):
+            if f.get("event") == "Fetch.requestPaused":
+                p = f.get("params", {}); rid = p.get("requestId"); req = p.get("request", {})
+                seen.append({"method": req.get("method"), "url": req.get("url")})
+                print("PAUSED %-4s %s" % (req.get("method"), (req.get("url") or "")[:100]))
+                conn.send_only(tid, "Fetch.continueRequest", {"requestId": rid})
+
+        conn.collect(secs, on_event=on_ev)
+        conn.cmd(tid, "Fetch.disable"); conn.close()
+        print("# intercepted & continued %d request(s) in %.0fs" % (len(seen), secs), file=sys.stderr); return
+
+    # console / network: the two reads ccb had and fcdp did NOT (added 2026-08-01).
+    # `raw` cannot cover these — raw sends COMMANDS, and console/network arrive as
+    # CDP *events*, so `raw Runtime.consoleAPICalled` errors ("not a method"). They
+    # need the same subscribe+collect plumbing `intercept` uses.
+    # Both capture what fires DURING the window; pass --reload to also catch
+    # page-load-time messages/requests (Log.enable alone replays only stored entries).
+    if c in ("console", "network"):
+        # Duration MUST be passed as `--secs N`. A bare positional number is
+        # ambiguous with tabId — resolve_tid() treats any digit-string as a tab id,
+        # so `fcdp console 5` silently targets nonexistent tab 5 and collects
+        # nothing (found the hard way 2026-08-01; `intercept` has the same latent
+        # ambiguity). `fcdp console <tabId> 5` still works because resolve_tid
+        # consumes the tabId first and leaves 5 in rest.
+        argv = a[1:]
+        secs = 6.0
+        if "--secs" in argv:
+            i = argv.index("--secs")
+            try:
+                secs = float(argv[i + 1])
+            except (IndexError, ValueError):
+                die("--secs needs a number, e.g. `fcdp %s --secs 8`" % c)
+            del argv[i:i + 2]
+        a = [a[0]] + argv
+        tid, rest = resolve_tid(a, 1)
+        reload_first = "--reload" in rest
+        rest = [x for x in rest if x != "--reload"]
+        if rest:
+            try:
+                secs = float(rest[0])
+            except ValueError:
+                pass
+        conn = Conn()
+        if c == "console":
+            evs = ["Runtime.consoleAPICalled", "Runtime.exceptionThrown", "Log.entryAdded"]
+        else:
+            evs = ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFailed"]
+        conn.subscribe(filter=evs, tabId=tid)
+        for dom in (["Runtime", "Log"] if c == "console" else ["Network"]):
+            conn.cmd(tid, dom + ".enable")
+        if reload_first:
+            conn.cmd(tid, "Page.enable"); conn.send_only(tid, "Page.reload", {"ignoreCache": True})
+        seen = []
+        req_method = {}
+
+        def _flat(arg):
+            """CDP RemoteObject -> printable scalar."""
+            if not isinstance(arg, dict):
+                return str(arg)
+            if "value" in arg:
+                return str(arg["value"])
+            return arg.get("description") or arg.get("unserializableValue") or arg.get("type", "?")
+
+        def on_ev(f):
+            ev, p = f.get("event"), f.get("params", {})
+            if ev == "Runtime.consoleAPICalled":
+                lvl = p.get("type", "log")
+                txt = " ".join(_flat(x) for x in p.get("args", []))
+                seen.append({"kind": "console", "level": lvl, "text": txt})
+                print("%-7s %s" % (lvl.upper(), txt[:200]))
+            elif ev == "Runtime.exceptionThrown":
+                d = (p.get("exceptionDetails") or {})
+                txt = d.get("text", "") + " " + ((d.get("exception") or {}).get("description") or "")
+                seen.append({"kind": "exception", "text": txt.strip()})
+                print("EXCEPT  %s" % txt.strip()[:200])
+            elif ev == "Log.entryAdded":
+                e = p.get("entry", {})
+                seen.append({"kind": "log", "level": e.get("level"), "text": e.get("text", "")})
+                print("%-7s %s" % ((e.get("level") or "log").upper(), (e.get("text") or "")[:200]))
+            elif ev == "Network.requestWillBeSent":
+                req_method[p.get("requestId")] = (p.get("request") or {}).get("method")
+            elif ev == "Network.responseReceived":
+                r = p.get("response") or {}
+                m = req_method.get(p.get("requestId")) or "?"
+                seen.append({"kind": "response", "status": r.get("status"), "method": m, "url": r.get("url")})
+                print("%-3s %-4s %s" % (r.get("status"), m, (r.get("url") or "")[:100]))
+            elif ev == "Network.loadingFailed":
+                seen.append({"kind": "failed", "error": p.get("errorText"), "requestId": p.get("requestId")})
+                print("FAIL    %s" % (p.get("errorText") or "")[:120])
+
+        conn.collect(secs, on_event=on_ev)
+        for dom in (["Runtime", "Log"] if c == "console" else ["Network"]):
+            conn.cmd(tid, dom + ".disable")
+        conn.close()
+        print("# %s: %d event(s) in %.0fs%s" % (c, len(seen), secs,
+              " (after reload)" if reload_first else ""), file=sys.stderr)
+        return
+
+    if c == "throttle":
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn(); conn.cmd(tid, "Network.enable")
+        r = conn.cmd(tid, "Network.emulateNetworkConditions", {
+            "offline": False, "latency": 400,
+            "downloadThroughput": int(400 * 1024 / 8), "uploadThroughput": int(400 * 1024 / 8),
+            "connectionType": "cellular3g"}); conn.close()
+        show(r); print("# applied Slow-3G to tab %s" % tid, file=sys.stderr); return
+
+    if c == "trace":
+        tid, rest = resolve_tid(a, 1)
+        out = rest[0] if rest else "/tmp/fcdp-trace-%s.json" % tid
+        conn = Conn()
+        conn.subscribe(filter=["Tracing.dataCollected", "Tracing.tracingComplete"], tabId=tid)
+        result_or_die(conn.cmd(tid, "Tracing.start", {"transferMode": "ReportEvents"}), "Tracing.start")
+        conn.cmd(tid, "Page.enable"); conn.send_only(tid, "Page.reload", {"ignoreCache": True})
+        evs = conn.collect(4.0); conn.send_only(tid, "Tracing.end"); evs += conn.collect(3.0)
+        conn.close()
+        trace_events = []; complete = False
+        for f in evs:
+            if f.get("event") == "Tracing.dataCollected":
+                trace_events.extend(f.get("params", {}).get("value", []))
+            if f.get("event") == "Tracing.tracingComplete":
+                complete = True
+        json.dump({"traceEvents": trace_events}, open(out, "w"))
+        print("wrote %s (%d trace events, complete=%s)" % (out, len(trace_events), complete)); return
+
+    die("unknown command: %s  (fcdp help)" % c)
+
+
+if __name__ == "__main__":
+    main()
