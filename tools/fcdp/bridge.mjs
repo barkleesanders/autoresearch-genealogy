@@ -114,7 +114,7 @@ wss.on('connection', (sock) => {
   sock._id = ++connSeq;
   conns.add(sock);
   log(`ext#${sock._id} connected (${conns.size} profile(s) live)`);
-  log('profile attestation: enforced by chrome-personal guard (bridge has no TCC access to profile files)');
+  log('profile attestation: labels claimed by extension instances (bridge has no TCC access to profile files)');
   sock.on('message', (buf) => {
     let msg;
     try {
